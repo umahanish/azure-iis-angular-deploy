@@ -1,0 +1,13 @@
+# Copy to backend.hcl and fill in your values, then:
+#   terraform init -backend-config=backend.hcl
+#
+# Reuses the same existing storage account referenced in terraform.tfvars
+# (existing_storage_account_name/_rg) — just a different container.
+resource_group_name = "rg-my-storage"
+storage_account_name = "myexistingstorageacct"
+container_name        = "tfstate"
+key                    = "iis-demo.tfstate"
+
+# Auth via your `az login` identity's Azure AD RBAC (no storage account key).
+# Requires "Storage Blob Data Contributor" on the storage account.
+use_azuread_auth = true

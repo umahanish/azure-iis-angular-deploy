@@ -37,17 +37,24 @@ if you're not sure.
 ```bash
 az ad app create --display-name "gh-actions-iis-deploy"
 # note the appId (client-id) and create a federated credential trusting
-# your repo/branch:
+# this job specifically. Since this job declares `environment: production`,
+# GitHub's OIDC subject claim is `environment:production`, NOT
+# `ref:refs/heads/main` — a job-level `environment:` always changes the
+# subject, so the federated credential must match it exactly or login fails:
 az ad app federated-credential create \
   --id <appId> \
   --parameters '{
-    "name": "gh-actions-main",
+    "name": "gh-actions-app-deploy",
     "issuer": "https://token.actions.githubusercontent.com",
-    "subject": "repo:<org>/<repo>:ref:refs/heads/main",
+    "subject": "repo:<org>/<repo>:environment:production",
     "audiences": ["api://AzureADTokenExchange"]
   }'
 az ad sp create --id <appId>
 ```
+
+This same app registration is reused by `.github/workflows/infra.yml` (the
+Terraform pipeline), which needs its own additional federated credentials —
+see the root [`README.md`](../README.md) for the full list.
 
 ### 3. Role assignments for that service principal
 | Scope | Role | Why |

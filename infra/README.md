@@ -21,14 +21,23 @@ Deploys:
 
 | File | Purpose |
 |---|---|
-| `providers.tf` | Terraform + provider version pins (azurerm, local) |
+| `providers.tf` | Terraform + provider version pins (azurerm, local) + remote state backend |
 | `variables.tf` | Input variables, including existing-resource references |
 | `main.tf` | All resources + data sources + health check |
 | `outputs.tf` | Public IP / site URL / blob URL / health-check outputs |
 | `IIS.ps1` | Script uploaded to blob storage and run on the VM |
 | `terraform.tfvars.example` | Sample values — copy to `terraform.tfvars` and fill in your real resource names |
+| `backend.hcl.example` | Sample remote-state backend config — copy to `backend.hcl` |
 
-## Usage
+## Remote state
+
+State is stored in Azure Storage (`backend "azurerm" {}` in `providers.tf`),
+reusing the same existing storage account referenced in `terraform.tfvars` —
+just a different container (`tfstate` by default). The backend block is left
+empty on purpose; values are supplied at `terraform init` time so the same
+config works both locally and in CI with different auth.
+
+## Usage (local)
 
 ```bash
 az login
@@ -39,10 +48,23 @@ cp terraform.tfvars.example terraform.tfvars
 #  - set a strong admin_password
 #  - restrict allowed_rdp_source (or set to "" to skip that rule)
 
-terraform init
+cp backend.hcl.example backend.hcl
+# edit backend.hcl to point at your existing storage account
+
+terraform init -backend-config=backend.hcl
 terraform plan
 terraform apply
 ```
+
+## Usage (CI)
+
+`.github/workflows/infra.yml` runs `fmt` + `validate` + `plan` on every PR
+touching `infra/**` (plan is posted as a PR comment and in the job summary),
+then `plan` + `apply` on push to `main` — the `apply` job is gated behind the
+`infra-production` GitHub Environment, so it waits for manual approval before
+touching real resources. `workflow_dispatch` also supports a manual `destroy`
+run. See the root [`README.md`](../README.md) for the full list of required
+secrets/variables and the one-time OIDC + environment setup.
 
 `terraform apply` will pause during the health check while it polls the
 site every `health_check_interval_seconds` (default 15s) up to

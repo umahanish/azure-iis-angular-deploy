@@ -1,0 +1,226 @@
+name: Terraform Infra (Azure IIS VM)
+
+on:
+  pull_request:
+    paths:
+      - 'infra/**'
+      - '.github/workflows/infra.yml'
+  push:
+    branches: [ main ]
+    paths:
+      - 'infra/**'
+      - '.github/workflows/infra.yml'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform action to run'
+        type: choice
+        options: [ plan, apply, destroy ]
+        default: plan
+
+permissions:
+  id-token: write     # required for Azure OIDC login
+  contents: read
+  pull-requests: write # required to comment the plan on a PR
+
+env:
+  TF_IN_AUTOMATION: 'true'
+  TF_VERSION: '1.13.3'
+
+  # --- Azure OIDC auth (shared with the app deploy workflow's app registration) ---
+  ARM_USE_OIDC: 'true'
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+  # --- Remote state backend (reuses the existing storage account) ---
+  TF_BACKEND_RG: ${{ vars.TF_BACKEND_RESOURCE_GROUP }}
+  TF_BACKEND_STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT }}
+  TF_BACKEND_CONTAINER: ${{ vars.TF_BACKEND_CONTAINER || 'tfstate' }}
+  TF_BACKEND_KEY: ${{ vars.TF_BACKEND_KEY || 'iis-demo.tfstate' }}
+
+  # --- Required Terraform variables (no defaults in variables.tf) ---
+  TF_VAR_existing_storage_account_name: ${{ vars.AZURE_STORAGE_ACCOUNT }}
+  TF_VAR_existing_storage_account_rg: ${{ vars.TF_BACKEND_RESOURCE_GROUP }}
+  TF_VAR_existing_vnet_name: ${{ vars.EXISTING_VNET_NAME }}
+  TF_VAR_existing_vnet_rg: ${{ vars.EXISTING_VNET_RG }}
+  TF_VAR_existing_subnet_name: ${{ vars.EXISTING_SUBNET_NAME }}
+  TF_VAR_admin_password: ${{ secrets.VM_ADMIN_PASSWORD }}
+
+  # --- Optional Terraform variables (fall back to variables.tf defaults) ---
+  TF_VAR_resource_group_name: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-iis-demo' }}
+  TF_VAR_location: ${{ vars.AZURE_LOCATION || 'East US' }}
+  TF_VAR_prefix: ${{ vars.AZURE_PREFIX || 'iisdemo' }}
+  TF_VAR_vm_size: ${{ vars.AZURE_VM_SIZE || 'Standard_B2s' }}
+  TF_VAR_admin_username: ${{ vars.AZURE_ADMIN_USERNAME || 'azureadmin' }}
+  TF_VAR_allowed_rdp_source: ${{ vars.ALLOWED_RDP_SOURCE || '*' }}
+
+jobs:
+  plan:
+    name: Format, Validate, Plan
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.action != 'destroy'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check required secrets/variables are set
+        run: |
+          missing=()
+          for v in TF_VAR_existing_storage_account_name TF_VAR_existing_storage_account_rg \
+                   TF_VAR_existing_vnet_name TF_VAR_existing_vnet_rg TF_VAR_existing_subnet_name \
+                   TF_VAR_admin_password TF_BACKEND_RG TF_BACKEND_STORAGE_ACCOUNT; do
+            if [ -z "${!v}" ]; then missing+=("$v"); fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "Missing required GitHub secrets/variables (mapped env vars): ${missing[*]}"
+            echo "See README.md 'Required GitHub configuration' for the full list."
+            exit 1
+          fi
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform fmt
+        run: terraform fmt -check -diff
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${TF_BACKEND_RG}" \
+            -backend-config="storage_account_name=${TF_BACKEND_STORAGE_ACCOUNT}" \
+            -backend-config="container_name=${TF_BACKEND_CONTAINER}" \
+            -backend-config="key=${TF_BACKEND_KEY}" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="use_oidc=true"
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Save human-readable plan
+        if: always()
+        run: terraform show -no-color tfplan > plan_output.txt
+
+      - name: Add plan to job summary
+        if: always()
+        run: |
+          {
+            echo '### Terraform Plan'
+            echo '```'
+            cat plan_output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment plan on pull request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('infra/plan_output.txt', 'utf8').slice(-60000);
+            const body = `### Terraform Plan\n<details><summary>Show plan</summary>\n\n\`\`\`\n${plan}\n\`\`\`\n</details>`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      - name: Upload plan artifact
+        if: github.event_name == 'push' || github.event.inputs.action == 'apply'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: infra/tfplan
+          retention-days: 1
+
+  apply:
+    name: Terraform Apply
+    needs: plan
+    if: github.event_name == 'push' || github.event.inputs.action == 'apply'
+    runs-on: ubuntu-latest
+    environment: infra-production
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${TF_BACKEND_RG}" \
+            -backend-config="storage_account_name=${TF_BACKEND_STORAGE_ACCOUNT}" \
+            -backend-config="container_name=${TF_BACKEND_CONTAINER}" \
+            -backend-config="key=${TF_BACKEND_KEY}" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="use_oidc=true"
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: infra
+
+      - name: Terraform apply
+        run: terraform apply -input=false -auto-approve tfplan
+
+      - name: Show outputs
+        run: terraform output
+
+  destroy:
+    name: Terraform Destroy
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    environment: infra-production
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check required secrets/variables are set
+        run: |
+          missing=()
+          for v in TF_VAR_existing_storage_account_name TF_VAR_existing_storage_account_rg \
+                   TF_VAR_existing_vnet_name TF_VAR_existing_vnet_rg TF_VAR_existing_subnet_name \
+                   TF_VAR_admin_password TF_BACKEND_RG TF_BACKEND_STORAGE_ACCOUNT; do
+            if [ -z "${!v}" ]; then missing+=("$v"); fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "Missing required GitHub secrets/variables (mapped env vars): ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${TF_BACKEND_RG}" \
+            -backend-config="storage_account_name=${TF_BACKEND_STORAGE_ACCOUNT}" \
+            -backend-config="container_name=${TF_BACKEND_CONTAINER}" \
+            -backend-config="key=${TF_BACKEND_KEY}" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="use_oidc=true"
+
+      - name: Terraform destroy
+        run: terraform destroy -input=false -auto-approve
