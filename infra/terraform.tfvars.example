@@ -1,0 +1,19 @@
+# --- New resources ---
+resource_group_name = "rg-iis-demo"
+location             = "East US"
+prefix                = "iisdemo"
+vm_size               = "Standard_B2s"
+admin_username        = "azureadmin"
+admin_password        = "ChangeMe123!ChangeMe" # use Key Vault / TF_VAR_ env var in real use
+allowed_rdp_source    = "203.0.113.10/32"      # lock this down to your own IP, or "" to skip the rule
+
+# --- Existing resources — fill these in with your own values ---
+existing_storage_account_name = "myexistingstorageacct"
+existing_storage_account_rg   = "rg-my-storage"
+container_name                 = "scripts"
+
+existing_vnet_name   = "my-existing-vnet"
+existing_vnet_rg     = "rg-my-network"
+existing_subnet_name = "my-existing-subnet"
+
+script_local_path = "./IIS.ps1"

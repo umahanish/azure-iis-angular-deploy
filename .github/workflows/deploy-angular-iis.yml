@@ -1,0 +1,165 @@
+name: Deploy Angular App to IIS (Azure VM)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'angular-app/**'
+      - 'deploy/**'
+      - '.github/workflows/deploy-angular-iis.yml'
+  workflow_dispatch: {}
+
+env:
+  NODE_VERSION: '20'
+  # Angular CLI build output folder — update to match your project.
+  # Angular 17+ with the esbuild/application builder outputs to
+  # dist/<project-name>/browser; older builders output straight to
+  # dist/<project-name>.
+  ANGULAR_DIST_PATH: 'dist/my-angular-app/browser'
+  RELEASES_CONTAINER: 'releases'
+  SITE_PATH: 'C:\inetpub\wwwroot'
+  APP_POOL_NAME: 'DefaultAppPool'
+
+permissions:
+  id-token: write   # required for Azure OIDC login
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: angular-app
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: angular-app/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Angular app (production)
+        run: npm run build -- --configuration production
+
+      - name: Add IIS web.config for SPA routing
+        run: cp ../deploy/web.config "${{ env.ANGULAR_DIST_PATH }}/web.config"
+
+      - name: Package build output
+        run: |
+          cd "${{ env.ANGULAR_DIST_PATH }}"
+          zip -r "${{ github.workspace }}/release.zip" .
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: angular-release
+          path: release.zip
+          retention-days: 5
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: angular-release
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Upload release to Storage and generate a read-only SAS URL
+        id: sas
+        env:
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+          BLOB_NAME="release-${{ github.sha }}.zip"
+
+          # Container + blob operations authenticated as the OIDC-logged-in
+          # service principal (needs "Storage Blob Data Contributor" on the
+          # storage account) — no account keys are used or exposed.
+          az storage container create \
+            --account-name "$STORAGE_ACCOUNT" \
+            --name "$RELEASES_CONTAINER" \
+            --auth-mode login >/dev/null
+
+          az storage blob upload \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$RELEASES_CONTAINER" \
+            --name "$BLOB_NAME" \
+            --file release.zip \
+            --auth-mode login \
+            --overwrite
+
+          EXPIRY=$(date -u -d "+30 minutes" '+%Y-%m-%dT%H:%MZ')
+
+          SAS=$(az storage blob generate-sas \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$RELEASES_CONTAINER" \
+            --name "$BLOB_NAME" \
+            --permissions r \
+            --expiry "$EXPIRY" \
+            --auth-mode login \
+            --as-user \
+            -o tsv)
+
+          URL=$(az storage blob url \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$RELEASES_CONTAINER" \
+            --name "$BLOB_NAME" \
+            -o tsv)
+
+          echo "sas_url=${URL}?${SAS}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy on the IIS VM
+        env:
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          VM_NAME: ${{ vars.AZURE_VM_NAME }}
+        run: |
+          set -euo pipefail
+          az vm run-command invoke \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$VM_NAME" \
+            --command-id RunPowerShellScript \
+            --scripts @deploy/Deploy-Angular.ps1 \
+            --parameters \
+              "BlobSasUrl=${{ steps.sas.outputs.sas_url }}" \
+              "SitePath=${{ env.SITE_PATH }}" \
+              "AppPoolName=${{ env.APP_POOL_NAME }}" \
+            --query "value[0].message" -o tsv
+
+      - name: Verify site is responding
+        env:
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          VM_NAME: ${{ vars.AZURE_VM_NAME }}
+        run: |
+          set -euo pipefail
+          PUBLIC_IP=$(az vm show -d -g "$RESOURCE_GROUP" -n "$VM_NAME" --query publicIps -o tsv)
+          echo "Checking http://$PUBLIC_IP ..."
+          for i in $(seq 1 10); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://$PUBLIC_IP" || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Site responded HTTP 200 at http://$PUBLIC_IP"
+              exit 0
+            fi
+            echo "Attempt $i/10: HTTP $STATUS, retrying in 10s..."
+            sleep 10
+          done
+          echo "❌ Site did not return HTTP 200 after deployment"
+          exit 1
